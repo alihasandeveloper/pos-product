@@ -14,7 +14,6 @@ Header Format:
 Authorization: Bearer {token}
 
 Required Token:
-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0LXVzZXIiLCJhdWQiOiJhcGkuZXhhbXBsZS5jb20iLCJpYXQiOjE2OTg1NjAwMDAsImV4cCI6MTY5ODU2MzYwMH0.4JcF5yO3z5uBvFhOQwI8JrR6qJ8tP9x7yQnPjG4kHhA
 
 -----------------------------------------------------
 
