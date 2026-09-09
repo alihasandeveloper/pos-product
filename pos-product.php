@@ -13,35 +13,122 @@ if (!defined('ABSPATH')) {
 
 class PosProduct
 {
-    private const BEARER_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0LXVzZXIiLCJhdWQiOiJhcGkuZXhhbXBsZS5jb20iLCJpYXQiOjE2OTg1NjAwMDAsImV4cCI6MTY5ODU2MzYwMH0.4JcF5yO3z5uBvFhOQwI8JrR6qJ8tP9x7yQnPjG4kHhA';
-
     public function __construct()
     {
         add_action('rest_api_init', function () {
             register_rest_route(
                 'pos/v1',
+                'login',
+                [
+                    'methods'             => 'POST',
+                    'callback'            => [$this, 'handle_login'],
+                    'permission_callback' => '__return_true',
+                ]
+            );
+
+            register_rest_route(
+                'pos/v1',
+                'verify',
+                [
+                    'methods'             => 'GET',
+                    'callback'            => [$this, 'handle_verify'],
+                    'permission_callback' => [$this, 'check_permission'],
+                ]
+            );
+
+            register_rest_route(
+                'pos/v1',
                 'product',
                 [
-                    'methods' => 'POST',
-                    'callback' => [$this, 'handle_product'],
+                    'methods'             => 'POST',
+                    'callback'            => [$this, 'handle_product'],
                     'permission_callback' => [$this, 'check_permission'],
                 ]
             );
         });
     }
 
-    public function check_permission($request): bool
+    public function check_permission($request)
     {
         $auth_header = $request->get_header('Authorization');
         if (empty($auth_header)) {
-            return false;
+            return new WP_Error('rest_forbidden', 'Invalid token', ['status' => 401]);
         }
 
         if (!preg_match('/^Bearer\s+(.+)$/i', $auth_header, $matches)) {
-            return false;
+            return new WP_Error('rest_forbidden', 'Invalid token', ['status' => 401]);
         }
 
-        return hash_equals(self::BEARER_TOKEN, $matches[1]);
+        $token = trim($matches[1]);
+
+        // Check dynamic token stored in transients
+        $token_data = get_transient('pos_auth_token_' . md5($token));
+        if ($token_data !== false) {
+            return true;
+        }
+
+        return new WP_Error('rest_forbidden', 'Invalid token', ['status' => 401]);
+    }
+
+    public function handle_login($request): WP_REST_Response
+    {
+        $body = $request->get_json_params();
+        $username = trim($body['username'] ?? '');
+        $password = $body['password'] ?? '';
+
+        if (empty($username) || empty($password)) {
+            return $this->error_response('Username and password are required', 400);
+        }
+
+        $user = wp_authenticate($username, $password);
+
+        if (is_wp_error($user)) {
+            return $this->error_response('Invalid username or password', 401);
+        }
+
+        $expires_in = 3600;
+        $token = bin2hex(random_bytes(32));
+
+        set_transient('pos_auth_token_' . md5($token), [
+            'user_id' => $user->ID,
+            'created' => time(),
+            'expires' => time() + $expires_in,
+        ], $expires_in);
+
+        return $this->success_response('Login successful', [
+            'token'      => $token,
+            'expires_in' => $expires_in,
+        ]);
+    }
+
+    public function handle_verify($request): WP_REST_Response
+    {
+        $route = $request->get_param('route');
+        $timestamp = current_time('Y-m-d H:i:s');
+
+        if (empty($route)) {
+            return $this->success_response('Authentication verified successfully', [
+                'timestamp'      => $timestamp,
+                'authentication' => 'authorized',
+            ]);
+        }
+
+        if ($route === 'product') {
+            return $this->success_response('Endpoint verification completed', [
+                'timestamp'        => $timestamp,
+                'authentication'   => 'authorized',
+                'endpoint_status'  => 'active',
+                'endpoint'         => '/pos/v1/product',
+                'endpoint_url'     => rest_url('pos/v1/product'),
+                'supported_events' => ['create', 'update', 'delete'],
+            ]);
+        }
+
+        return $this->success_response('Endpoint verification completed', [
+            'timestamp'        => $timestamp,
+            'authentication'   => 'authorized',
+            'endpoint_status'  => 'not_found',
+        ]);
     }
 
     public function handle_product($request)
@@ -73,7 +160,7 @@ class PosProduct
 
 
         if (!empty($existing)) {
-            return $this->error_response('Product already exists', 409);
+            return $this->update_product($data);
         }
 
 
@@ -81,10 +168,24 @@ class PosProduct
 
         $product->set_name($data['Name'] ?? '');
         $product->set_status('publish');
-        $product->set_regular_price($data['OldPrice'] ?? $data['Price'] ?? 0);
-        $product->set_price($data['Price'] ?? 0);
         $product->set_sku($data['Code'] ?? '');
         $product->set_description($data['Description'] ?? '');
+
+        // Price & OldPrice handling (OldPrice = regular price, Price = sale price)
+        $has_price = isset($data['Price']) && $data['Price'] !== '';
+        $has_old_price = isset($data['OldPrice']) && $data['OldPrice'] !== '';
+
+        if ($has_old_price && $has_price && (float)$data['OldPrice'] > (float)$data['Price']) {
+            $product->set_regular_price((string)$data['OldPrice']);
+            $product->set_sale_price((string)$data['Price']);
+            $product->set_price((string)$data['Price']);
+        } elseif ($has_price) {
+            $product->set_regular_price((string)$data['Price']);
+            $product->set_price((string)$data['Price']);
+        } elseif ($has_old_price) {
+            $product->set_regular_price((string)$data['OldPrice']);
+            $product->set_price((string)$data['OldPrice']);
+        }
 
         // Stock from WarehouseList (sum all warehouses) or fallback to CurrentStock
         $stock_qty = $this->get_total_stock($data);
@@ -138,7 +239,7 @@ class PosProduct
 
         $existing_ids = $this->get_product($pos_id);
         if (empty($existing_ids)) {
-            return $this->error_response('Product not found', 404);
+            return $this->create_product($data);
         }
 
         $product = wc_get_product($existing_ids[0]);
@@ -146,19 +247,47 @@ class PosProduct
             return $this->error_response('Failed to load product', 500);
         }
 
-        $product->set_name($data['Name'] ?? $product->get_name());
-        $product->set_regular_price($data['OldPrice'] ?? $data['Price'] ?? $product->get_regular_price());
-        $product->set_price($data['Price'] ?? $product->get_price());
-        $product->set_description($data['Description'] ?? $product->get_description());
+        if (isset($data['Name'])) {
+            $product->set_name($data['Name']);
+        }
 
-        if (!empty($data['Code'])) {
+        if (isset($data['Description'])) {
+            $product->set_description($data['Description']);
+        }
+
+        if (isset($data['Code'])) {
             $product->set_sku($data['Code']);
         }
 
-        // Stock
-        $stock_qty = $this->get_total_stock($data);
-        $product->set_stock_quantity($stock_qty);
-        $product->set_stock_status($stock_qty > 0 ? 'instock' : 'outofstock');
+        // Price & OldPrice updates
+        $has_price = isset($data['Price']) && $data['Price'] !== '';
+        $has_old_price = isset($data['OldPrice']) && $data['OldPrice'] !== '';
+
+        if ($has_price || $has_old_price) {
+            $current_regular = (float)$product->get_regular_price();
+            $current_sale = (float)$product->get_sale_price();
+
+            $price = $has_price ? (float)$data['Price'] : ($current_sale > 0 ? $current_sale : $current_regular);
+            $old_price = $has_old_price ? (float)$data['OldPrice'] : $current_regular;
+
+            if ($old_price > $price) {
+                $product->set_regular_price((string)$old_price);
+                $product->set_sale_price((string)$price);
+                $product->set_price((string)$price);
+            } else {
+                $product->set_regular_price((string)$price);
+                $product->set_sale_price('');
+                $product->set_price((string)$price);
+            }
+        }
+
+        // Stock (only update if provided)
+        if (isset($data['WarehouseList']) || isset($data['CurrentStock'])) {
+            $stock_qty = $this->get_total_stock($data);
+            $product->set_manage_stock(true);
+            $product->set_stock_quantity($stock_qty);
+            $product->set_stock_status($stock_qty > 0 ? 'instock' : 'outofstock');
+        }
 
         // Category
         if (!empty($data['CategoryName'])) {
@@ -182,10 +311,19 @@ class PosProduct
             return $this->error_response('Failed to update product', 500);
         }
 
-        // Update POS meta
-        update_post_meta($product_id, 'product_pos_barcode', $data['ProductBarcode'] ?? '');
-        update_post_meta($product_id, 'product_pos_cost_price', $data['CostPrice'] ?? 0);
-        update_post_meta($product_id, 'product_pos_unit', $data['UnitName'] ?? '');
+        // Update POS meta only if provided
+        if (isset($data['Type'])) {
+            update_post_meta($product_id, 'product_pos_type', $data['Type']);
+        }
+        if (isset($data['ProductBarcode'])) {
+            update_post_meta($product_id, 'product_pos_barcode', $data['ProductBarcode']);
+        }
+        if (isset($data['CostPrice'])) {
+            update_post_meta($product_id, 'product_pos_cost_price', $data['CostPrice']);
+        }
+        if (isset($data['UnitName'])) {
+            update_post_meta($product_id, 'product_pos_unit', $data['UnitName']);
+        }
 
         // Update image only if a new one is provided
         if (!empty($data['ImagePath'])) {
